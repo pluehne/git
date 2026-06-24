@@ -89,7 +89,27 @@ struct paint_state {
 	int p1_count;
 	int p2_count;
 	int pending_merge_bases;
+	int unreliable_generations;
 };
+
+/*
+ * A commit with a committer date of 2^32 seconds or more (in the year 2106 or
+ * later) overflowed the 32-bit accumulator that prior Git versions used when
+ * computing generation numbers [1]. Such commit graphs store generation
+ * numbers that are not strictly monotonically increasing from parents to
+ * children. The generation-based traversal optimizations rely on that
+ * invariant, so when an input commit falls into this range we cannot trust the
+ * commit graph and must fall back to a full walk.
+ *
+ * [1] Fixed in fbcc5408fcd60206234ba26cc103ef2757532ae0
+ */
+static int generation_number_may_be_truncated(struct commit *commit)
+{
+	timestamp_t generation = commit_graph_generation(commit);
+
+	return generation != GENERATION_NUMBER_INFINITY &&
+	       generation >= GENERATION_NUMBER_32_BIT_OVERFLOW;
+}
 
 static void paint_count_update(struct paint_state *state,
 			       unsigned flags, int delta)
@@ -150,8 +170,14 @@ static struct commit *paint_queue_get(struct paint_state *state)
 		 * region the queue is ordered topologically, so
 		 * no future step can add paint to visited commits
 		 * and an exhausted side cannot reappear.
+		 *
+		 * This reasoning only holds when generation numbers
+		 * are reliable; an inconsistent commit graph can
+		 * order the queue non-topologically, so skip the
+		 * optimization in that case.
 		 */
 		if ((!state->p1_count || !state->p2_count) &&
+		    !state->unreliable_generations &&
 		    commit_graph_generation(commit) < GENERATION_NUMBER_INFINITY)
 			return NULL;
 	}
@@ -190,9 +216,14 @@ static int paint_down_to_common(struct repository *r,
 		return 0;
 	}
 	paint_queue_put(&state, one, 0);
+	if (generation_number_may_be_truncated(one))
+		state.unreliable_generations = 1;
 
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n; i++) {
 		paint_queue_put(&state, twos[i], PARENT2);
+		if (generation_number_may_be_truncated(twos[i]))
+			state.unreliable_generations = 1;
+	}
 
 	while ((commit = paint_queue_get(&state))) {
 		struct commit_list *parents;
@@ -869,6 +900,7 @@ static enum contains_result contains_tag_algo(struct commit *candidate,
 	enum contains_result result;
 	timestamp_t cutoff = GENERATION_NUMBER_INFINITY;
 	const struct commit_list *p;
+	int unreliable_generations = 0;
 
 	for (p = want; p; p = p->next) {
 		timestamp_t generation;
@@ -877,7 +909,18 @@ static enum contains_result contains_tag_algo(struct commit *candidate,
 		generation = commit_graph_generation(c);
 		if (generation < cutoff)
 			cutoff = generation;
+		if (generation_number_may_be_truncated(c))
+			unreliable_generations = 1;
 	}
+
+	/*
+	 * The cutoff lets contains_test() prune any commit whose generation is
+	 * below the lowest wanted generation. That is only safe when generation
+	 * numbers increase from parents to children, which a truncated
+	 * generation can violate, so disable the cutoff in that case.
+	 */
+	if (unreliable_generations)
+		cutoff = GENERATION_NUMBER_ZERO;
 
 	result = contains_test(candidate, want, cache, cutoff);
 	if (result != CONTAINS_UNKNOWN)
@@ -1032,6 +1075,7 @@ int can_all_from_reach(struct commit_list *from, struct commit_list *to,
 	int result;
 	timestamp_t min_commit_date = cutoff_by_min_date ? from->item->date : 0;
 	timestamp_t min_generation = GENERATION_NUMBER_INFINITY;
+	int unreliable_generations = 0;
 
 	while (from_iter) {
 		add_object_array(&from_iter->item->object, NULL, &from_objs);
@@ -1044,6 +1088,8 @@ int can_all_from_reach(struct commit_list *from, struct commit_list *to,
 			generation = commit_graph_generation(from_iter->item);
 			if (generation < min_generation)
 				min_generation = generation;
+			if (generation_number_may_be_truncated(from_iter->item))
+				unreliable_generations = 1;
 		}
 
 		from_iter = from_iter->next;
@@ -1058,11 +1104,24 @@ int can_all_from_reach(struct commit_list *from, struct commit_list *to,
 			generation = commit_graph_generation(to_iter->item);
 			if (generation < min_generation)
 				min_generation = generation;
+			if (generation_number_may_be_truncated(to_iter->item))
+				unreliable_generations = 1;
 		}
 
 		to_iter->item->object.flags |= PARENT2;
 
 		to_iter = to_iter->next;
+	}
+
+	/*
+	 * The walk below prunes commits whose generation is below the lowest
+	 * endpoint generation, as in a consistent commit graph they cannot be a
+	 * destination. A truncated generation breaks that ordering, so disable
+	 * the generation and commit-date cutoffs and walk unbounded.
+	 */
+	if (unreliable_generations) {
+		min_generation = GENERATION_NUMBER_ZERO;
+		min_commit_date = 0;
 	}
 
 	result = can_all_from_reach_with_flag(&from_objs, PARENT2, PARENT1,

@@ -13,6 +13,7 @@ struct tree;
 #define GENERATION_NUMBER_V1_MAX 0x3FFFFFFF
 #define GENERATION_NUMBER_ZERO 0
 #define GENERATION_NUMBER_V2_OFFSET_MAX ((1ULL << 31) - 1)
+#define GENERATION_NUMBER_32_BIT_OVERFLOW (1ULL << 32)
 
 struct commit_list {
 	struct commit *item;
